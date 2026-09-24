@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +11,8 @@ const TERMS_FILE: &str = "terms.fst";
 const POSTINGS_FILE: &str = "postings.bin";
 const DOCS_FILE: &str = "docs.bin";
 const EMBEDDINGS_FILE: &str = "embeddings.bin";
+const FORWARD_FILE: &str = "forward.bin";
+const FORWARD_OFFSETS_FILE: &str = "forward_offsets.bin";
 
 /// Writes `v` as an unsigned LEB128 varint (7 payload bits per byte, high
 /// bit set on every byte but the last). Returns the number of bytes
@@ -200,6 +202,43 @@ fn write_docs_file(path: &Path, docs: &[(String, u32)]) -> io::Result<()> {
     w.flush()
 }
 
+/// Encodes one file's forward-index block (see DESIGN.md's "Component 8"):
+/// `varint(term_count)` then, per term in ascending order, `varint(term_len)
+/// ++ term_bytes ++ varint(freq)`. Unlike `postings.bin`, terms are stored
+/// directly rather than referencing `terms.fst` -- this index has no
+/// dependency on the term dictionary's build order, so it's built entirely
+/// within phase 1, right alongside the term->frequency map itself.
+pub fn encode_forward_block(terms: &BTreeMap<String, u32>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_uvarint(&mut buf, terms.len() as u64).expect("writing to a Vec<u8> never fails");
+    for (term, freq) in terms {
+        write_uvarint(&mut buf, term.len() as u64).expect("writing to a Vec<u8> never fails");
+        buf.extend_from_slice(term.as_bytes());
+        write_uvarint(&mut buf, u64::from(*freq)).expect("writing to a Vec<u8> never fails");
+    }
+    buf
+}
+
+/// Writes `forward.bin` (each file's block, from `blocks`, concatenated in
+/// `file_id` order) and `forward_offsets.bin` (`N + 1` fixed-stride `u64`
+/// (LE) byte offsets into it -- one per `file_id`, plus a trailing sentinel
+/// equal to `forward.bin`'s total length, so a block's length is always
+/// `offsets[i + 1] - offsets[i]` with no special case for the last one).
+/// See DESIGN.md's "Component 8".
+fn write_forward_files(forward_path: &Path, offsets_path: &Path, blocks: &[Vec<u8>]) -> io::Result<()> {
+    let mut forward_writer = BufWriter::new(File::create(forward_path)?);
+    let mut offsets_writer = BufWriter::new(File::create(offsets_path)?);
+    let mut offset = 0u64;
+    for block in blocks {
+        offsets_writer.write_all(&offset.to_le_bytes())?;
+        forward_writer.write_all(block)?;
+        offset += block.len() as u64;
+    }
+    offsets_writer.write_all(&offset.to_le_bytes())?;
+    forward_writer.flush()?;
+    offsets_writer.flush()
+}
+
 /// `embeddings.bin`: a fixed-stride array, one record per `file_id` --
 /// `u32 dim` (LE) header, then `count x dim` `f16` values (LE). Every
 /// record is the same size, so looking one up needs no varint framing --
@@ -216,24 +255,28 @@ fn write_embeddings_file(path: &Path, dim: usize, vectors: &[Vec<f32>]) -> io::R
     w.flush()
 }
 
-/// Builds a project's index (`terms.fst` + `postings.bin` + `docs.bin`,
-/// plus `embeddings.bin` when embedding vectors are supplied) from the
-/// spill runs and per-file data gathered during the parallel walk, then
-/// atomically publishes it: every file is written under `build_dir` first,
-/// and only once all of them have been flushed successfully are they
-/// renamed into `project_dir` (a plain rename, since both directories are
-/// on the same filesystem) -- so a crash or interrupt during the build
-/// never touches whatever index was already there.
+/// Builds a project's index (`terms.fst` + `postings.bin` + `docs.bin` +
+/// `forward.bin` + `forward_offsets.bin`, plus `embeddings.bin` when
+/// embedding vectors are supplied) from the spill runs and per-file data
+/// gathered during the parallel walk, then atomically publishes it: every
+/// file is written under `build_dir` first, and only once all of them have
+/// been flushed successfully are they renamed into `project_dir` (a plain
+/// rename, since both directories are on the same filesystem) -- so a
+/// crash or interrupt during the build never touches whatever index was
+/// already there.
 pub fn build_index(
     build_dir: &Path,
     project_dir: &Path,
     spill_paths: &[PathBuf],
     docs: &[(String, u32)],
+    forward_blocks: &[Vec<u8>],
     embeddings: Option<(usize, &[Vec<f32>])>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let terms_tmp = build_dir.join(TERMS_FILE);
     let postings_tmp = build_dir.join(POSTINGS_FILE);
     let docs_tmp = build_dir.join(DOCS_FILE);
+    let forward_tmp = build_dir.join(FORWARD_FILE);
+    let forward_offsets_tmp = build_dir.join(FORWARD_OFFSETS_FILE);
 
     {
         let mut postings_writer = BufWriter::new(File::create(&postings_tmp)?);
@@ -243,8 +286,15 @@ pub fn build_index(
         fst_builder.finish()?;
     }
     write_docs_file(&docs_tmp, docs)?;
+    write_forward_files(&forward_tmp, &forward_offsets_tmp, forward_blocks)?;
 
-    let mut file_names = vec![TERMS_FILE, POSTINGS_FILE, DOCS_FILE];
+    let mut file_names = vec![
+        TERMS_FILE,
+        POSTINGS_FILE,
+        DOCS_FILE,
+        FORWARD_FILE,
+        FORWARD_OFFSETS_FILE,
+    ];
     if let Some((dim, vectors)) = embeddings {
         let embeddings_tmp = build_dir.join(EMBEDDINGS_FILE);
         write_embeddings_file(&embeddings_tmp, dim, vectors)?;

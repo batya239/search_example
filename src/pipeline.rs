@@ -24,11 +24,13 @@ pub struct RunStats {
 
 /// One worker thread's contribution: the spill files it wrote, the
 /// `(file_id, relative_path, doc_length)` triples for every file it
-/// indexed, and -- when embeddings are enabled -- the `(file_id, vector)`
-/// pair for each of those files too.
+/// indexed, that same file's encoded forward-index block (see
+/// `store::encode_forward_block`), and -- when embeddings are enabled --
+/// the `(file_id, vector)` pair for each of those files too.
 struct ThreadOutput {
     spill_paths: Vec<PathBuf>,
     docs: Vec<(u64, String, u32)>,
+    forward_blocks: Vec<(u64, Vec<u8>)>,
     embeddings: Vec<(u64, Vec<f32>)>,
 }
 
@@ -48,6 +50,7 @@ struct ThreadState<'a> {
     embedding_model: Option<&'a EmbeddingModel>,
     buffer: Vec<(String, u64, u32)>,
     docs: Vec<(u64, String, u32)>,
+    forward_blocks: Vec<(u64, Vec<u8>)>,
     embeddings: Vec<(u64, Vec<f32>)>,
     spill_paths: Vec<PathBuf>,
 }
@@ -57,6 +60,7 @@ impl ThreadState<'_> {
         let file_id = self.file_id_counter.fetch_add(1, Ordering::Relaxed);
         let doc_length: u32 = terms.values().sum();
         self.docs.push((file_id, rel_path, doc_length));
+        self.forward_blocks.push((file_id, store::encode_forward_block(&terms)));
         if let Some(vector) = embedding {
             self.embeddings.push((file_id, vector));
         }
@@ -88,6 +92,7 @@ impl Drop for ThreadState<'_> {
         let output = ThreadOutput {
             spill_paths: std::mem::take(&mut self.spill_paths),
             docs: std::mem::take(&mut self.docs),
+            forward_blocks: std::mem::take(&mut self.forward_blocks),
             embeddings: std::mem::take(&mut self.embeddings),
         };
         self.outputs.lock().unwrap().push(output);
@@ -109,8 +114,8 @@ impl Drop for ThreadState<'_> {
 /// there's no per-file cross-thread hand-off, only a once-per-thread one at
 /// teardown. Phase 2, run after every thread has finished and joined,
 /// merges all the spill files into the project's `terms.fst` /
-/// `postings.bin` / `docs.bin` (and `embeddings.bin`, if enabled) -- see
-/// `store::build_index`.
+/// `postings.bin` / `docs.bin` / `forward.bin` / `forward_offsets.bin` (and
+/// `embeddings.bin`, if enabled) -- see `store::build_index`.
 pub fn run(
     root: &Path,
     project_dir: &Path,
@@ -165,6 +170,7 @@ pub fn run(
             embedding_model,
             buffer: Vec::new(),
             docs: Vec::new(),
+            forward_blocks: Vec::new(),
             embeddings: Vec::new(),
             spill_paths: Vec::new(),
         };
@@ -179,6 +185,7 @@ pub fn run(
     let outputs = outputs.into_inner().unwrap();
     let total_files = file_id_counter.load(Ordering::Relaxed) as usize;
     let mut doc_entries: Vec<Option<(String, u32)>> = vec![None; total_files];
+    let mut forward_slots: Vec<Option<Vec<u8>>> = vec![None; total_files];
     let mut embedding_slots: Vec<Option<Vec<f32>>> = if embedding_model.is_some() {
         vec![None; total_files]
     } else {
@@ -190,6 +197,9 @@ pub fn run(
         for (file_id, path, doc_length) in output.docs {
             doc_entries[file_id as usize] = Some((path, doc_length));
         }
+        for (file_id, block) in output.forward_blocks {
+            forward_slots[file_id as usize] = Some(block);
+        }
         for (file_id, vector) in output.embeddings {
             embedding_slots[file_id as usize] = Some(vector);
         }
@@ -197,6 +207,10 @@ pub fn run(
     let doc_entries: Vec<(String, u32)> = doc_entries
         .into_iter()
         .map(|d| d.expect("every file_id must have exactly one recorded doc entry"))
+        .collect();
+    let forward_blocks: Vec<Vec<u8>> = forward_slots
+        .into_iter()
+        .map(|b| b.expect("every file_id must have exactly one recorded forward-index block"))
         .collect();
 
     let embedding_vectors: Option<Vec<Vec<f32>>> = embedding_model.map(|_| {
@@ -209,7 +223,14 @@ pub fn run(
         .zip(embedding_vectors.as_ref())
         .map(|(model, vectors)| (model.dim(), vectors.as_slice()));
 
-    store::build_index(&build_dir, project_dir, &spill_paths, &doc_entries, embeddings_arg)?;
+    store::build_index(
+        &build_dir,
+        project_dir,
+        &spill_paths,
+        &doc_entries,
+        &forward_blocks,
+        embeddings_arg,
+    )?;
     fs::remove_dir_all(&build_dir)?;
 
     Ok(RunStats {

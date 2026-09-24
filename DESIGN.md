@@ -11,10 +11,13 @@ file — built fresh from scratch on every run rather than mutated in place.
 Postings now carry per-document **term frequency** (not just presence), and
 per-document **length** is recorded alongside its path, so a future BM25
 ranking searcher can be built directly on top of this data without another
-on-disk format change — see "Storage" and "Non-goals." A second, optional
-index sits alongside it: one fixed-size **embedding vector per file**,
-produced by a small static code-embedding model, for future similarity
-search — see "Component 7."
+on-disk format change — see "Storage" and "Non-goals." A **forward index**
+sits alongside the inverted one — the same term→frequency data, re-keyed by
+document instead of by term, for direct doc → terms lookups the inverted
+index isn't shaped for — see "Component 8." A third, optional index also
+sits alongside both: one fixed-size **embedding vector per file**, produced
+by a small static code-embedding model, for future similarity search — see
+"Component 7."
 
 ## Non-goals (v1)
 
@@ -266,7 +269,7 @@ file's total token count, which travels alongside its path into `docs.bin`
 normalization term. This is also where the old design's per-file hashing
 step used to sit; see "Storage" for why that's gone.
 
-### 5. Storage — a static `fst` term dictionary + append-only postings
+### 5. Storage — a static `fst` term dictionary + append-only inverted postings
 
 Unlike a KV store, `fst::Map` has no "insert into an existing index" API —
 keys must be written once, in strictly increasing lexicographic order, in a
@@ -282,12 +285,20 @@ directory itself is chosen):
 
 ```
 <project index dir>/
-  terms.fst     — fst::Map<&[u8], u64>: identifier text -> byte offset
-                  into postings.bin
-  postings.bin  — append-only; one block per unique identifier, at the
-                  offset stored for it in terms.fst
-  docs.bin      — file_id -> relative path, in file_id order
-  PROJECT_PATH  — sidecar audit file, unchanged from before
+  terms.fst             — fst::Map<&[u8], u64>: identifier text -> byte
+                          offset into postings.bin (the INVERTED index:
+                          term -> docs)
+  postings.bin          — append-only; one block per unique identifier, at
+                          the offset stored for it in terms.fst
+  docs.bin              — file_id -> relative path, in file_id order
+  forward_offsets.bin   — file_id -> byte offset into forward.bin (the
+                          FORWARD index: doc -> terms; see "Component 8")
+  forward.bin           — one block per file_id, at the offset stored for
+                          it in forward_offsets.bin
+  embeddings.bin        — optional; file_id -> embedding vector, only
+                          written when --embedding-model is given (see
+                          "Component 7")
+  PROJECT_PATH          — sidecar audit file, unchanged from before
 ```
 
 **`postings.bin` block format** — one block per unique identifier,
@@ -529,6 +540,88 @@ vector)` pairs gathered via `ThreadOutput` — the identical "scatter into a
 `Vec` sized to the final file count, indexed by `file_id`" pattern already
 used for `docs.bin`'s paths.
 
+### 8. Forward index — `forward.bin` + `forward_offsets.bin`
+
+Everything in "Storage" (Component 5) is **inverted**: term → the set of
+documents containing it, which is exactly what a query like "which files
+contain identifier X" needs. It is not shaped for the opposite question —
+"what terms does document Y contain, and how often" — which currently has
+no answer short of re-parsing the file from scratch. A **forward index**
+answers that directly: the same term→frequency data Component 4 already
+computes, persisted a second time, keyed by document instead of by term.
+
+This isn't in service of any consumer built in this doc (still no query
+command — see "Non-goals") — it's the same "make the data available now,
+so the format doesn't need to change later" reasoning already applied to
+BM25's term frequency/doc length and to the embeddings vectors. The kind of
+future feature this unlocks: given a doc id (e.g. one already surfaced by
+an inverted-index or embedding-similarity query), directly retrieve *its*
+terms and frequencies — for re-ranking, snippet/highlight generation, or a
+simple "more like this" via term overlap — without re-reading and
+re-parsing that file's source.
+
+**On-disk format** — deliberately independent of the term dictionary (no
+term IDs, no cross-references into `terms.fst`/`postings.bin`): each
+document's block is self-contained, holding its own term text directly.
+This trades some disk space (a term like `get` costs 3 bytes again in
+every document's block that contains it, rather than once in the shared
+trie) for simplicity — no new id-assignment scheme, and it can be built
+entirely within phase 1, with no dependency on phase 2's merge order (see
+"Build process" below).
+
+```
+forward.bin           — one block per file_id, concatenated in file_id
+                         order, at the offset forward_offsets.bin gives it:
+                           varint(term_count)
+                           varint(term_len[0]) ++ term_bytes[0] ++ varint(freq[0])
+                           varint(term_len[1]) ++ term_bytes[1] ++ varint(freq[1])
+                           ...                    (terms in ascending order,
+                                                    same as the BTreeMap
+                                                    from Component 4)
+forward_offsets.bin    — N+1 × u64 (LE), fixed stride: offsets[i] is
+                         forward.bin's byte offset for file_id i's block;
+                         offsets[N] (one past the last file_id) is
+                         forward.bin's total length, so a block's length is
+                         always offsets[i+1] - offsets[i] with no special
+                         case for the last file
+```
+
+`forward_offsets.bin` is to `forward.bin` exactly what `terms.fst` is to
+`postings.bin`: a fixed-cost lookup structure that turns "which bytes hold
+this key's data" into O(1) arithmetic (`file_id × 8`) instead of a scan —
+the same mmap-friendly shape as the rest of this design, just keyed by the
+dense integer `file_id` instead of term bytes, so a full FST isn't needed
+here: a flat array already gives O(1) lookup for a dense integer key.
+
+**Build process**: computed entirely in phase 1, no phase-2 dependency.
+For every file, right where Component 4's term→frequency `BTreeMap` is
+built and *before* it's flattened into `(term, file_id, freq)` triples for
+the spill buffer, the same map is also encoded into one `forward.bin`
+block (iterating the `BTreeMap` a second time, by reference, doesn't
+disturb the move into the spill buffer that follows it). That block travels
+through `ThreadOutput` as a `(file_id, Vec<u8>)` pair, alongside the
+existing `(file_id, path, doc_length)` triple and (when enabled) the
+`(file_id, embedding)` pair — one more field on the same struct, no new
+hand-off. In phase 2, once every thread has joined and the final file count
+is known, blocks are scattered into a `Vec` indexed by `file_id` (the same
+pattern already used for `docs.bin` and `embeddings.bin`), then written out
+in order while a running byte-offset is recorded into `forward_offsets.bin`
+— a linear pass, no sorting or merging needed, since phase 1 already
+produced these blocks in the correct (per-file) shape.
+
+Unlike `embeddings.bin`, this index has no external dependency (no model to
+provision) and no CLI opt-in — it's always built, alongside `docs.bin`.
+
+**Verification note**: because this carries the *same* underlying
+`(file_id, term, freq)` facts as the inverted postings, just transposed,
+the two can be cross-checked against each other directly — for a given
+document, the set of `(term, freq)` pairs decoded from its `forward.bin`
+block must exactly equal the set of `(term, freq)` pairs obtained by
+scanning every `postings.bin` block for entries matching that `file_id`.
+That's a stronger check than either side alone, and cheap to run against a
+small hand-built corpus, so it's the verification this component gets
+before being considered done.
+
 ## Concurrency model
 
 - `WalkParallel` owns the traversal threads (configurable count, defaults to
@@ -556,6 +649,10 @@ used for `docs.bin`'s paths.
   triples already do: bundled into `ThreadOutput`, handed off once per
   thread at teardown through the existing `Mutex<Vec<ThreadOutput>>` — no
   new shared state or synchronization primitive needed for this feature.
+- The forward index (Component 8) needs no new concurrency at all: each
+  thread encodes a file's block right where it already builds that file's
+  term→frequency map, and the encoded bytes ride to the main thread through
+  the same per-thread `ThreadOutput` hand-off as everything else.
 
 ## Config
 
@@ -639,3 +736,11 @@ just needs an `io::Write`), so it isn't a dependency yet.
    `storage-root`, presumably behind its own explicit opt-in flag) would be
    more convenient but was deliberately not built, to keep this tool's
    default behavior fully offline.
+8. **Forward index compaction**: `forward.bin` (Component 8) stores raw
+   term bytes per document rather than referencing the shared `terms.fst`
+   trie, trading disk space for independence from the term dictionary's
+   build order. If that overhead matters at scale, a term-id indirection
+   (assigned once `terms.fst` is built, then substituted into the forward
+   blocks in a follow-up pass) would shrink it — not built here, since it
+   would need its own ordering pass across phase 2 and there's no consumer
+   yet whose needs would justify the complexity.
