@@ -52,7 +52,7 @@ search — see "Component 7."
                             ▼
                  ┌────────────────────┐
                  │ extension allowlist │  skip unless extension is one of the
-                 │       check         │  11 supported (see "File selection")
+                 │       check         │  12 supported (see "File selection")
                  └──────────┬─────────┘
                             │ extension recognized
                             ▼
@@ -136,8 +136,7 @@ This path only runs when `--embedding-model <dir>` is supplied (see
 
 File selection is **by extension, against an explicit allowlist** — not
 "try to parse it and see." A file is only considered for indexing if its
-extension is one of the 11 below; everything else (including extensions
-tree-sitter could technically handle, like `.py`) is skipped in v1. This
+extension is one of the 12 below; everything else is skipped. This
 replaces the old "extension → grammar lookup, skip if unmapped" step:
 unmapped now just means "not in this table."
 
@@ -154,6 +153,7 @@ value rather than being a reserved word.
 | `.java` | Java | `tree-sitter-java` | `identifier`, `type_identifier` |
 | `.kt` | Kotlin | `tree-sitter-kotlin-ng` (the original `tree-sitter-kotlin` is unmaintained) | `identifier` |
 | `.go` | Go | `tree-sitter-go` | `identifier`, `type_identifier`, `field_identifier`, `package_identifier` |
+| `.py` | Python | `tree-sitter-python` | `identifier` |
 | `.js` | JavaScript | `tree-sitter-javascript` | `identifier`, `property_identifier`, `shorthand_property_identifier`, `shorthand_property_identifier_pattern`, `private_property_identifier`, `statement_identifier` |
 | `.ts` | TypeScript | `tree-sitter-typescript` | same as `.js`, plus `type_identifier` |
 | `.json` | JSON | `tree-sitter-json` | none — see structural extraction note below |
@@ -165,10 +165,13 @@ value rather than being a reserved word.
 > Node-kind names above were verified against each grammar's generated
 > `node-types.json` during implementation. Composite/dotted-path wrapper
 > kinds (e.g. Rust's `scoped_identifier`, Kotlin's `qualified_identifier`,
-> TypeScript's `nested_identifier`) are deliberately excluded: they only
-> ever wrap the leaf identifier kinds above as children, and a full-tree
-> walk already visits those leaves directly, so including the wrapper too
-> would just add a redundant, less-precise hash of the whole dotted path.
+> TypeScript's `nested_identifier`, Python's `dotted_name`) are deliberately
+> excluded: they only ever wrap the leaf identifier kinds above as children,
+> and a full-tree walk already visits those leaves directly, so including
+> the wrapper too would just add a redundant, less-precise hash of the whole
+> dotted path. Python has no separate `type_identifier`/`field_identifier`
+> kinds the way Rust or Go do — it's dynamically typed, and attribute access
+> (`obj.attr`) is just a plain `identifier` on the right of a `.`.
 >
 > **JSON is structural, not kind-based:** JSON has no identifier-kind node
 > at all — an object key is a plain `string` node, indistinguishable by
@@ -229,7 +232,7 @@ than reimplementing a sniffing heuristic.
 
 ### 3. Language detection
 
-A static `HashMap<&str, Language>` keyed by the 11 supported extensions,
+A static `HashMap<&str, Language>` keyed by the 12 supported extensions,
 per the "File selection" table above (`"rs"` → `tree_sitter_rust::LANGUAGE`,
 `"json"` → `tree_sitter_json::LANGUAGE`, etc.) — this map *is* the
 allowlist; there's no separate "supported extensions" list to keep in
@@ -240,7 +243,7 @@ of an entry in this map.
 
 Two extraction strategies, dispatched by extension:
 
-- **Tree-sitter languages** (`.rs .java .kt .go .js .ts .json .toml .xml`):
+- **Tree-sitter languages** (`.rs .java .kt .go .py .js .ts .json .toml .xml`):
   walk the parsed tree (via `tree_sitter::TreeCursor`) and collect the text
   of every node whose `.kind()` is in that language's identifier node-kind
   list from the "File selection" table. For the programming languages
